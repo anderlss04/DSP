@@ -1,0 +1,99 @@
+
+BOX_SERVER  = "express42/ubuntu12.04-chef11"
+BOX_DESKTOP = "thorerik/ubuntu-20.04-desktop"
+VBNET = "bind9"
+VBFOLDER    = "/DNSLAB9"
+
+DOMAIN = "anderdns.local"
+RED    = "192.168.1"
+DNSIP  = "#{RED}.2"
+
+$dnsclient = <<-SHELL
+  echo "nameserver $1\ndomain $2">/etc/resolv.conf
+SHELL
+
+$apacheserver = <<-SHELL
+  apt-get update
+  apt-get install -y apache2
+  echo "<h1>Bienvenido a $1! ($2)</h>">/var/www/html/index.html
+SHELL
+
+$nginxserver = <<-SHELL
+  apt-get update
+  apt-get install -y nginx
+  echo "<h1>Bienvenido a $1! ($2)</h>">/var/www/html/index.nginx-debian.html
+SHELL
+
+services = {
+  "nginx"   => { :ip => "#{RED}.10", :provision=>$nginxserver,  :port=> "8080" },
+  "apache1" => { :ip => "#{RED}.11", :provision=>$apacheserver, :port=> "8081" },
+  "apache2" => { :ip => "#{RED}.12", :provision=>$apacheserver, :port=> "8082" },
+}
+
+Vagrant.configure("2") do |config|
+  # config general
+  config.vm.box = BOX_SERVER
+  if Vagrant.has_plugin?("vagrant-vbguest")
+    config.vbguest.auto_update = false
+  end
+
+  config.vm.provider "vmware_desktop" do |v|
+    v.cpus = 1
+    v.memory = 1024
+    v.customize ["modifyvm", :id, "--groups", VBFOLDER]
+  end
+
+  # dns 
+  config.vm.define :dns do |guest|
+    guest.vm.provider "vmware_desktop" do |v, subconfig|
+      v.name = "dns"
+      subconfig.vm.hostname = "dns.#{DOMAIN}"
+      subconfig.vm.network :private_network, ip: DNSIP,  vmware_desktop__intnet: VBNET 
+    end
+    guest.vm.provision "shell", name: "dns-server", path: "enable-bind9.sh", args: "#{DNSIP} #{DOMAIN}"
+  end
+
+  # services 
+  services.each_with_index do |(hostname, info), idx|
+    config.vm.define hostname do |guest|
+      guest.vm.provider :vmware_desktop do |v, subconfig|
+        v.name = hostname
+        subconfig.vm.hostname = "#{hostname}.#{DOMAIN}"
+        subconfig.vm.network :private_network, ip: info[:ip], vmware_desktop__intnet: VBNET
+      end
+      guest.vm.provision "shell", name: "dns-client \##{idx}", inline: $dnsclient, args: "#{DNSIP} #{DOMAIN}"
+      guest.vm.provision "shell", name: "#{hostname}:#{info[:port]}", inline: info[:provision], args:  "#{hostname} #{DOMAIN}"
+      guest.vm.network "forwarded_port", guest: 80, host: info[:port]
+    end 
+  end
+  
+  # clientes GUI
+  (1..2).each do |id|
+    config.vm.define "client#{id}" do |guest|
+      guest.vm.provider "vmware_desktop" do |v, subconfig|
+        v.name = "client#{id}"
+        if id>1
+          v.gui = true
+          v.cpus = 2
+          v.memory = 2048
+          subconfig.vm.box = BOX_DESKTOP
+          subconfig.vbguest.auto_update = true
+        end
+        subconfig.vm.hostname = "client#{id}.#{DOMAIN}"
+        subconfig.vm.network :private_network, ip: "#{RED}.#{100+id}",  vmware_desktop__intnet: VBNET
+        
+      end
+      guest.vm.provision "shell", name: "dns-client", inline: $dnsclient, args: "#{DNSIP} #{DOMAIN}"
+      guest.vm.provision "shell", name: "testing dns", inline: <<-SHELL
+        dig google.com +short              
+        dig -x 192.168.1.2 +short           
+        ping -a -c 1 apache1                
+        ping -a -c 1 apache2.anderdns.local  
+        curl apache1 --no-progress-meter    
+        curl apache2 --no-progress-meter   
+        curl nginx --no-progress-meter      
+        nslookup nginx                      
+      SHELL
+    end
+  end
+end
